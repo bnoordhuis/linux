@@ -354,10 +354,11 @@
 #define __NR_setns		346
 #define __NR_process_vm_readv	347
 #define __NR_process_vm_writev	348
+#define __NR_epoll_ctlv	349
 
 #ifdef __KERNEL__
 
-#define NR_syscalls 349
+#define NR_syscalls 350
 
 #define __ARCH_WANT_IPC_PARSE_VERSION
 #define __ARCH_WANT_OLD_READDIR

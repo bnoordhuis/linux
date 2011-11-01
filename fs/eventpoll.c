@@ -95,6 +95,8 @@
 
 #define EP_MAX_EVENTS (INT_MAX / sizeof(struct epoll_event))
 
+#define EP_MAX_CTL_EVENTS (INT_MAX / sizeof(struct epoll_ctl_event))
+
 #define EP_UNACTIVE_PTR ((void *) -1L)
 
 #define EP_ITEM_COST (sizeof(struct epitem) + sizeof(struct eppoll_entry))
@@ -1311,6 +1313,117 @@ static int ep_loop_check(struct eventpoll *ep, struct file *file)
 			      ep_loop_check_proc, file, ep, current);
 }
 
+/**
+ * ep_ctl - Add/change/remove a file descriptor from the interest set.
+ *
+ * @file: Pointer to the epoll file.
+ * @op: The operation to perform, one of the EPOLL_CTL_(ADD|MOD|DEL) constants.
+ * @fd: The file descriptor to perform the operation on.
+ * @event: Pointer to the epoll_event structure, may be NULL for EPOLL_CTL_DEL.
+ *
+ * Returns: Returns zero if the operation was succesful, or an error code
+ *          in case of failure.
+ */
+static int ep_ctl(struct file *file, int op, int fd,
+	struct epoll_event *event)
+{
+	int error;
+	int did_lock_epmutex = 0;
+	struct file *tfile;
+	struct eventpoll *ep;
+	struct epitem *epi;
+
+	BUG_ON(event == NULL && op != EPOLL_CTL_DEL);
+
+	/* Get the "struct file *" for the target file */
+	error = -EBADF;
+	tfile = fget(fd);
+	if (!tfile)
+		goto error_fput;
+
+	/* The target file descriptor must support poll */
+	error = -EPERM;
+	if (!tfile->f_op || !tfile->f_op->poll)
+		goto error_fput;
+
+	/*
+	 * We have to check that the file structure underneath the file descriptor
+	 * the user passed to us _is_ an eventpoll file. And also we do not permit
+	 * adding an epoll file descriptor inside itself.
+	 */
+	error = -EINVAL;
+	if (file == tfile || !is_file_epoll(file))
+		goto error_fput;
+
+	/*
+	 * At this point it is safe to assume that the "private_data" contains
+	 * our own data structure.
+	 */
+	ep = file->private_data;
+
+	/*
+	 * When we insert an epoll file descriptor, inside another epoll file
+	 * descriptor, there is the change of creating closed loops, which are
+	 * better be handled here, than in more critical paths.
+	 *
+	 * We hold epmutex across the loop check and the insert in this case, in
+	 * order to prevent two separate inserts from racing and each doing the
+	 * insert "at the same time" such that ep_loop_check passes on both
+	 * before either one does the insert, thereby creating a cycle.
+	 */
+	if (unlikely(is_file_epoll(tfile) && op == EPOLL_CTL_ADD)) {
+		mutex_lock(&epmutex);
+		did_lock_epmutex = 1;
+		error = -ELOOP;
+		if (ep_loop_check(ep, tfile) != 0)
+			goto error_tgt_fput;
+	}
+
+
+	mutex_lock_nested(&ep->mtx, 0);
+
+	/*
+	 * Try to lookup the file inside our RB tree, Since we grabbed "mtx"
+	 * above, we can be sure to be able to use the item looked up by
+	 * ep_find() till we release the mutex.
+	 */
+	epi = ep_find(ep, tfile, fd);
+
+	error = -EINVAL;
+	switch (op) {
+	case EPOLL_CTL_ADD:
+		if (!epi) {
+			event->events |= POLLERR | POLLHUP;
+			error = ep_insert(ep, event, tfile, fd);
+		} else
+			error = -EEXIST;
+		break;
+	case EPOLL_CTL_DEL:
+		if (epi)
+			error = ep_remove(ep, epi);
+		else
+			error = -ENOENT;
+		break;
+	case EPOLL_CTL_MOD:
+		if (epi) {
+			event->events |= POLLERR | POLLHUP;
+			error = ep_modify(ep, epi, event);
+		} else
+			error = -ENOENT;
+		break;
+	}
+	mutex_unlock(&ep->mtx);
+
+error_tgt_fput:
+	if (unlikely(did_lock_epmutex))
+		mutex_unlock(&epmutex);
+
+error_fput:
+	fput(tfile);
+
+	return error;
+}
+
 /*
  * Open an eventpoll file descriptor.
  */
@@ -1359,109 +1472,71 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 		struct epoll_event __user *, event)
 {
 	int error;
-	int did_lock_epmutex = 0;
-	struct file *file, *tfile;
-	struct eventpoll *ep;
-	struct epitem *epi;
+	struct file *file;
 	struct epoll_event epds;
 
-	error = -EFAULT;
 	if (ep_op_has_event(op) &&
 	    copy_from_user(&epds, event, sizeof(struct epoll_event)))
-		goto error_return;
+		return -EFAULT;
 
 	/* Get the "struct file *" for the eventpoll file */
-	error = -EBADF;
 	file = fget(epfd);
 	if (!file)
-		goto error_return;
+		return -EBADF;
 
-	/* Get the "struct file *" for the target file */
-	tfile = fget(fd);
-	if (!tfile)
-		goto error_fput;
+	error = ep_ctl(file, op, fd, &epds);
+	fput(file);
 
-	/* The target file descriptor must support poll */
-	error = -EPERM;
-	if (!tfile->f_op || !tfile->f_op->poll)
-		goto error_tgt_fput;
+	return error;
+}
 
-	/*
-	 * We have to check that the file structure underneath the file descriptor
-	 * the user passed to us _is_ an eventpoll file. And also we do not permit
-	 * adding an epoll file descriptor inside itself.
-	 */
-	error = -EINVAL;
-	if (file == tfile || !is_file_epoll(file))
-		goto error_tgt_fput;
+SYSCALL_DEFINE3(epoll_ctlv, int, epfd,
+	struct epoll_ctl_event __user *, events, int, nevents)
+{
+	struct epoll_ctl_event fast_kevents[8];
+	struct epoll_ctl_event *kevents;
+	struct file *file;
+	int error;
+	int n;
 
-	/*
-	 * At this point it is safe to assume that the "private_data" contains
-	 * our own data structure.
-	 */
-	ep = file->private_data;
+	BUILD_BUG_ON(sizeof(events[0]) != sizeof(kevents[0]));
 
-	/*
-	 * When we insert an epoll file descriptor, inside another epoll file
-	 * descriptor, there is the change of creating closed loops, which are
-	 * better be handled here, than in more critical paths.
-	 *
-	 * We hold epmutex across the loop check and the insert in this case, in
-	 * order to prevent two separate inserts from racing and each doing the
-	 * insert "at the same time" such that ep_loop_check passes on both
-	 * before either one does the insert, thereby creating a cycle.
-	 */
-	if (unlikely(is_file_epoll(tfile) && op == EPOLL_CTL_ADD)) {
-		mutex_lock(&epmutex);
-		did_lock_epmutex = 1;
-		error = -ELOOP;
-		if (ep_loop_check(ep, tfile) != 0)
-			goto error_tgt_fput;
+	if (nevents <= 0 || nevents > EP_MAX_CTL_EVENTS)
+		return -EINVAL;
+
+	if (!access_ok(VERIFY_READ, events, nevents * sizeof(events[0])))
+		return -EFAULT;
+
+	file = fget(epfd);
+	if (!file)
+		return -EBADF;
+
+	if (nevents <= ARRAY_SIZE(fast_kevents))
+		kevents = fast_kevents;
+	else {
+		kevents = kmalloc(nevents * sizeof(kevents[0]), GFP_KERNEL);
+		if (kevents == NULL) {
+			error = -ENOMEM;
+			goto error_fput;
+		}
 	}
 
-
-	mutex_lock_nested(&ep->mtx, 0);
-
-	/*
-	 * Try to lookup the file inside our RB tree, Since we grabbed "mtx"
-	 * above, we can be sure to be able to use the item looked up by
-	 * ep_find() till we release the mutex.
-	 */
-	epi = ep_find(ep, tfile, fd);
-
-	error = -EINVAL;
-	switch (op) {
-	case EPOLL_CTL_ADD:
-		if (!epi) {
-			epds.events |= POLLERR | POLLHUP;
-			error = ep_insert(ep, &epds, tfile, fd);
-		} else
-			error = -EEXIST;
-		break;
-	case EPOLL_CTL_DEL:
-		if (epi)
-			error = ep_remove(ep, epi);
-		else
-			error = -ENOENT;
-		break;
-	case EPOLL_CTL_MOD:
-		if (epi) {
-			epds.events |= POLLERR | POLLHUP;
-			error = ep_modify(ep, epi, &epds);
-		} else
-			error = -ENOENT;
-		break;
+	if (copy_from_user(kevents, events, nevents * sizeof(kevents[0]))) {
+		error = -EFAULT;
+		goto error_kfree;
 	}
-	mutex_unlock(&ep->mtx);
 
-error_tgt_fput:
-	if (unlikely(did_lock_epmutex))
-		mutex_unlock(&epmutex);
+	for (n = 0; n < nevents; n++)
+		if (ep_ctl(file, kevents[n].op, kevents[n].fd, &kevents[n].event))
+			break;
+	error = n;
 
-	fput(tfile);
+error_kfree:
+	if (kevents != fast_kevents)
+		kfree(kevents);
+
 error_fput:
 	fput(file);
-error_return:
 
 	return error;
 }
