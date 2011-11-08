@@ -1493,13 +1493,11 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 SYSCALL_DEFINE3(epoll_ctlv, int, epfd,
 	struct epoll_ctl_event __user *, events, int, nevents)
 {
-	struct epoll_ctl_event fast_kevents[8];
-	struct epoll_ctl_event *kevents;
+	struct epoll_ctl_event e;
 	struct file *file;
-	int error;
 	int n;
 
-	BUILD_BUG_ON(sizeof(events[0]) != sizeof(kevents[0]));
+	BUILD_BUG_ON(sizeof(e) != sizeof(events[0]));
 
 	if (nevents <= 0 || nevents > EP_MAX_CTL_EVENTS)
 		return -EINVAL;
@@ -1511,34 +1509,15 @@ SYSCALL_DEFINE3(epoll_ctlv, int, epfd,
 	if (!file)
 		return -EBADF;
 
-	if (nevents <= ARRAY_SIZE(fast_kevents))
-		kevents = fast_kevents;
-	else {
-		kevents = kmalloc(nevents * sizeof(kevents[0]), GFP_KERNEL);
-		if (kevents == NULL) {
-			error = -ENOMEM;
-			goto error_fput;
-		}
-	}
-
-	if (copy_from_user(kevents, events, nevents * sizeof(kevents[0]))) {
-		error = -EFAULT;
-		goto error_kfree;
-	}
-
-	for (n = 0; n < nevents; n++)
-		if (ep_ctl(file, kevents[n].op, kevents[n].fd, &kevents[n].event))
+	for (n = 0; n < nevents; n++) {
+		if (copy_from_user(&e, events + n, sizeof(e)))
 			break;
-	error = n;
+		if (ep_ctl(file, e.op, e.fd, &e.event))
+			break;
+	}
 
-error_kfree:
-	if (kevents != fast_kevents)
-		kfree(kevents);
-
-error_fput:
 	fput(file);
-
-	return error;
+	return n;
 }
 
 /*
