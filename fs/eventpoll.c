@@ -1512,7 +1512,7 @@ SYSCALL_DEFINE3(epoll_ctlv, int, epfd,
 	for (n = 0; n < nevents; n++) {
 		if (copy_from_user(&e, events + n, sizeof(e)))
 			break;
-		if (ep_ctl(file, e.op, e.fd, &e.event))
+		if (ep_ctl(file, e.op, e.fd, (struct epoll_event *) &e))
 			break;
 	}
 

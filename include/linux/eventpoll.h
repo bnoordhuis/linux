@@ -50,9 +50,10 @@ struct epoll_event {
 } EPOLL_PACKED;
 
 struct epoll_ctl_event {
-	int fd;
-	int op;
-	struct epoll_event event;
+	__u32 events;
+	__u64 data;
+	__u32 op;
+	__u32 fd;
 } EPOLL_PACKED;
 
 #ifdef __KERNEL__
