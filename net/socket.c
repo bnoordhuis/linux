@@ -1577,6 +1577,89 @@ out_fd:
 	goto out_put;
 }
 
+SYSCALL_DEFINE5(acceptv,
+		int, fd,
+		int __user *, newfds_ptr,
+		int, newfds_len,
+		int __user *, nfds_ptr,
+		int, flags)
+{
+	struct socket *sock, *newsock;
+	struct file *newfile;
+	int nfds, err, newfd, fput_needed;
+	int newfds[64];
+
+	nfds = 0;
+
+	err = -EINVAL;
+	if (flags & ~(SOCK_CLOEXEC | SOCK_NONBLOCK))
+		goto out;
+
+	if (newfds_len <= 0 || newfds_len > ARRAY_SIZE(newfds))
+		goto out;
+
+	if (SOCK_NONBLOCK != O_NONBLOCK && (flags & SOCK_NONBLOCK))
+		flags = (flags & ~SOCK_NONBLOCK) | O_NONBLOCK;
+
+	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+	if (!sock)
+		goto out;
+
+	while (nfds < newfds_len) {
+		err = -ENFILE;
+		newsock = sock_alloc();
+		if (!newsock)
+			goto out_put;
+
+		newsock->type = sock->type;
+		newsock->ops = sock->ops;
+
+		/*
+		 * We don't need try_module_get here, as the listening socket (sock)
+		 * has the protocol module (sock->ops->owner) held.
+		 */
+		__module_get(newsock->ops->owner);
+
+		newfd = sock_alloc_file(newsock, &newfile, flags);
+		if (unlikely(newfd < 0)) {
+			err = newfd;
+			sock_release(newsock);
+			goto out_put;
+		}
+
+		err = security_socket_accept(sock, newsock);
+		if (err)
+			goto out_fd;
+
+		err = sock->ops->accept(sock, newsock, sock->file->f_flags);
+		if (err < 0) {
+			if (err == -EAGAIN)
+				err = 0;
+			goto out_fd;
+		}
+
+		/* File flags are not inherited via accept() unlike another OSes. */
+
+		fd_install(newfd, newfile);
+		nfds++;
+	}
+
+	err = 0;
+
+out_put:
+	fput_light(sock->file, fput_needed);
+out:
+	if (copy_to_user(&nfds, nfds_ptr, sizeof(nfds)))
+		err = -EFAULT;
+	if (copy_to_user(newfds, newfds_ptr, nfds * sizeof(newfds[0])))
+		err = -EFAULT;
+	return err;
+out_fd:
+	fput(newfile);
+	put_unused_fd(newfd);
+	goto out_put;
+}
+
 SYSCALL_DEFINE3(accept, int, fd, struct sockaddr __user *, upeer_sockaddr,
 		int __user *, upeer_addrlen)
 {
