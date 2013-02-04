@@ -8,6 +8,15 @@
 #include "cpumap.h"
 #include "thread_map.h"
 
+/* Dummy to satisfy linker. */
+bool test_attr__enabled;
+
+/* Dummy to satisfy linker. */
+void test_attr__open(struct perf_event_attr *attr, pid_t pid, int cpu,
+	int fd, int group_fd, unsigned long flags)
+{
+}
+
 /* Define PyVarObject_HEAD_INIT for python 2.5 */
 #ifndef PyVarObject_HEAD_INIT
 # define PyVarObject_HEAD_INIT(type, size) PyObject_HEAD_INIT(type) size,
